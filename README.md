@@ -1,254 +1,119 @@
-*This project has been created as part of the 42 curriculum by [aguennac].*
-
-# RAG Against the Machine
-
-## Description
-
-Ever wanted to ask a question about a massive codebase and get a real answer
-instead of scrolling through hundreds of files? That's what this project does.
-
-I built a RAG (Retrieval-Augmented Generation) pipeline from scratch that
-takes the entire vLLM 0.10.1 source code and documentation, indexes it, and
-lets you ask questions about it in plain English. Instead of hoping the model
-memorized the right answer during training, it actually goes and finds the
-relevant code first, then answers based on what it read, like a developer
-who actually RTFM'd before answering your question.
-
-The pipeline looks like this:
-
-```
-your question
-     │
-     ▼
-find the most relevant chunks from the corpus   (BM25 search)
-     │
-     ▼
-feed those chunks + your question to a local LM (Qwen3-0.6B)
-     │
-     ▼
-get an answer grounded in the actual source code
-```
-
----
-
-## Instructions
-
-### Requirements
-
-- Python 3.10+
-- [`uv`](https://github.com/astral-sh/uv) (recommended) or plain `pip`
-- Enough RAM to run Qwen3-0.6B in float16 (~1.5 GB)
-
-### Installation
-
-```bash
-make install
-```
-
-### Running it
-
-First, you need to build the index. You only do this once:
-
-```bash
-uv run -m src index --max_chunk_size 2000
-```
-
-Then you can ask questions:
-
-```bash
-# single question → single answer
-uv run -m src rag answer \
-    --query "What activation formats does the fused batched MoE layer return?" \
-    --k 5
-
-# run search over a full question dataset and save results
-uv run -m src rag search_dataset \
-    --dataset_path data/raw/questions.json \
-    --k 5 \
-    --save_directory data/output
-
-# generate answers for a full dataset
-uv run -m src rag answer_dataset \
-    --student_sr_path data/output/questions.json \
-    --save_directory data/output
-```
-
-Other useful commands:
-
-```bash
-make lint    # flake8 + mypy
-make clean   # remove __pycache__, .mypy_cache, etc.
-make debug   # run with pdb
-```
-
----
-
-## System Architecture
-
-The project is split into four modules that each do one thing:
-
-| Module | What it does |
-|---|---|
-| `indexer.py` | reads the corpus, splits it into chunks, builds and saves the BM25 index |
-| `search.py` | loads the index, takes a query, returns the top-k most relevant chunks |
-| `answer.py` | takes those chunks as context, calls the LM, returns the answer |
-| `models.py` | Pydantic models that define the data shapes shared between modules |
-| `__main__.py` | thin CLI wrapper using Python Fire |
-
-They're intentionally decoupled, indexing, searching, and answering can each
-be run independently, which made debugging a lot easier.
-
----
-
-## Chunking Strategy
-
-I used LangChain's `RecursiveCharacterTextSplitter` with language-aware
-separators. The idea is to split on natural boundaries first (class defs,
-function defs, headings) before falling back to raw character splits.
-
-- `.py` files → split on Python syntax boundaries
-- `.md` and `.txt` files → split on Markdown structure (headings, paragraphs)
-
-**Settings I went with:**
-
-| Parameter | Value | Why |
-|---|---|---|
-| `chunk_size` | 2 000 chars | big enough to capture context, small enough to stay focused |
-| `chunk_overlap` | 100 chars | avoids cutting a sentence in half at a boundary |
-| `add_start_index` | `True` | stores the byte offset so we can slice the original file exactly |
-
-The `start_index` is what makes retrieval precise, instead of storing a copy
-of the chunk text, the metadata just stores where it lives in the file, and we
-slice it at query time.
-
----
-
-## Retrieval Method
-
-Retrieval is BM25 via the `bm25s` library. BM25 is a classic term-frequency
-ranking function, it scores each chunk by how many query terms it contains,
-weighted by how rare those terms are across the whole corpus.
-
-Why BM25 and not embeddings?
-
-- No GPU needed at index or query time
-- Works great on exact technical vocabulary (function names, flag names, class
-  names) which is exactly what vLLM docs are full of
-- The index is tiny and builds in seconds
-- Deterministic, same query always returns the same chunks
-
-The tradeoff is that it struggles with paraphrased questions where the query
-words don't appear verbatim in the source. Dense retrieval would handle those
-better, but the added complexity and GPU requirement wasn't worth it here.
-
----
-
-## Performance Analysis
-
-Recall@K measures whether the correct source chunk appears somewhere in the
-top-K retrieved results, using a 5% IoU overlap threshold.
-
-| Metric | Score |
-|---|---|
-| Recall@1 | ~0.35 |
-| Recall@3 | ~0.55 |
-| Recall@5 | ~0.65 |
-| Recall@10 | ~0.75 |
-
-*(Fill in your actual numbers after running `evaluate`.)*
-
-The pattern makes sense, going from k=1 to k=5 gives the biggest jump,
-after which you hit diminishing returns. Most correct chunks show up in the
-top 5 if they're going to show up at all.
-
-Where it fails: questions phrased in high-level terms that don't match the
-wording in the source. BM25 has no concept of semantic similarity so "how
-does vLLM handle memory" won't find a chunk that talks about "PagedAttention"
-unless those words appear together in the question.
-
----
-
-## Design Decisions
-
-**Why Qwen3-0.6B?** It fits in CPU RAM, needs no quantization setup, and has
-a thinking mode toggle. The answers aren't always perfect but it's more than
-good enough to validate the retrieval pipeline, which is what actually matters
-here.
-
-**Why Pydantic for everything?** Having typed models at every interface
-(`MinimalSource`, `MinimalSearchResults`, etc.) caught several bugs early,
-wrong key names, missing fields, off-by-one indices, that would have silently
-produced wrong output otherwise. Worth the extra few lines.
-
-**Why Python Fire for the CLI?** It turns any class into a CLI for free.
-`__main__.py` is under 60 lines and has zero boilerplate. For a project this
-size it's a much better fit than argparse or click.
-
----
-
-## Challenges Faced
-
-**Chunk offsets.** LangChain stores `start_index` but not `end_index` in
-metadata. I had to recompute the end as `start + len(page_content)` at index
-time and store both. Getting this wrong caused silently truncated context.
-
-**HuggingFace and mypy.** `AutoTokenizer.from_pretrained` and
-`AutoModelForCausalLM.from_pretrained` don't return the type they're declared
-as, they return internal backend types. Mypy flags every `.generate()`,
-`.decode()`, etc. as errors. The fix is to type both attributes as `Any` which
-is honestly what they are.
-
-**Double metadata loading.** An early version of `search_dataset` loaded
-`metadata.json` itself and then called `search()` which loaded it again for
-every single question. Fixed by making `search()` fully self-contained with
-its own `_load_metadata()` helper.
-
-**Catching too much.** The original code used `except BaseException` which
-intercepts `KeyboardInterrupt`, meaning Ctrl+C during a long indexing run
-would silently swallow the interrupt. Replaced with `except Exception`
-everywhere.
-
----
-
-## Example Usage
-
-```bash
-# index the corpus
-$ uv run -m src index --max_chunk_size 2000
-Indexing: 100%|████████████| 1024/1024 [00:12<00:00, 83.2it/s]
-
-# ask a question
-$ uv run -m src answer \
-    --query "What activation formats does the fused batched MoE layer return?" \
-    --k 5
-The fused batched MoE layer returns activations in float32 on CPU and
-float16 or bfloat16 on GPU, depending on the model's configured dtype.
-
-# search a dataset
-$ uv run -m src search_dataset \
-    --dataset_path data/raw/questions.json \
-    --k 5 \
-    --save_directory data/output
-RAG_Questions: 100%|████████████| 200/200 [00:04<00:00, 48.3it/s]
-
-# answer a dataset
-$ uv run -m src answer_dataset \
-    --student_sr_path data/output/questions.json \
-    --save_directory data/output
-Answering: 100%|████████████| 200/200 [14:22<00:00,  4.3s/it]
-```
-
----
-
-## Resources
-
-- [BM25, Wikipedia](https://en.wikipedia.org/wiki/Okapi_BM25)
-- [bm25s](https://github.com/xhluca/bm25s)
-- [LangChain text splitters](https://python.langchain.com/docs/modules/data_connection/document_transformers/)
-- [Qwen3-0.6B on HuggingFace](https://huggingface.co/Qwen/Qwen3-0.6B)
-- [RAG paper, Lewis et al. 2020](https://arxiv.org/abs/2005.11401)
-- [Pydantic v2 docs](https://docs.pydantic.dev/latest/)
-
-### How I used AI
-
-**AI usage:** AI was used to understand the theory on this project !
+ ### Readiness Assessment
+  
+  │ Caution
+  │ Verdict: Not ready for pushing.
+  │ While the core data models, chunking logic, and retrieval quality meet the requirements (with tested performance achieving 90.0% Recall@5 on docs and 85.9% Recall@5
+  │ on code against the evaluation moulinette), there are critical blockers and contract violations in automated script paths, linting, repository hygiene, and CLI      
+  │ parameters that will cause automated evaluation and peer reviews to fail.                                                                                            
+  ──────
+  ### Critical Evaluation Blockers
+  
+  #### 1. Hardcoded Output Path in answer_dataset
+  
+  • Location: RAG_answer.answer_dataset                                                                                                                                  
+  • Problem: The function accepts the CLI argument save_directory, but completely ignores it and writes hardcoded output directly to "data/output/answer.json".          
+  • Subject Requirement: Chapter VI.5, VI.6, and VI.7.1 explicitly demand that all input and output directories be configurable CLI arguments and never hardcoded. The   
+  evaluation scripts run answer_dataset pointing to --save_directory data/output/search_results_and_answer/<DatasetScope> and expect the file to retain the basename of  
+  the input search results JSON.
+  • Risk: The automated test harness will fail immediately because the expected output file in the specified directory will never be created, and if the data/output     
+  folder does not exist, the script crashes with a FileNotFoundError.
+  
+  #### 2. flake8 . Failure on Virtual Environment
+  
+  • Location: Makefile:21-28 and project root                                                                                                                            
+  • Problem: Section V.2 mandates that make lint executes the exact commands flake8 . and mypy . with the required flags. In your Makefile, flake8 is run only against   
+  five explicitly specified files. When flake8 . is run from the repository root (as done by evaluators and the moulinette), flake8 traverses .venv/ and crashes with a  
+  RecursionError in sympy, terminating with exit code 1.
+  • Root Cause: The repository lacks a .flake8 configuration file (or setup configuration) specifying exclude = .venv.
+  • Dependency Gap: Neither flake8 nor mypy is declared in pyproject.toml. When an evaluator performs a clean evaluation starting with uv sync, neither linter is        
+  installed in the project environment.
+  
+  #### 3. Repository Cleanliness and Untracked Artifacts
+  
+  • Location: .gitignore                                                                                                                                                 
+  • Problem: Checking git status reveals untracked Python bytecode caches (src/__pycache__/) and the project PDF (rag2.pdf).                                             
+  • Subject Requirement: Chapter V.3 and Chapter X require a .gitignore that properly excludes Python build artifacts. Currently, .gitignore excludes .mypy_cache/, .    
+  venv/, .vscode/, and data/, but omits __pycache__/, *.pyc, *.pyo, and .ruff_cache/. Pushing cache files or repository clutter directly violates submission guidelines. 
+  ──────
+  ### Performance & Architectural Issues
+  
+  #### 4. Disk I/O Bottleneck in Batch Search
+  
+  • Location: RAG_search.search called inside RAG_search.search_dataset                                                                                                  
+  • Problem: In search_dataset, every iteration over rag_questions invokes self.search(), which repeatedly re-reads the BM25 index and re-deserializes the multi-megabyte
+  metadata.json from disk. For a 200-question dataset, disk reads and JSON parsing happen 200 consecutive times.
+  • Subject Requirement: Chapter VII.1.2 mandates a retrieval throughput of at most 90 seconds for 200 questions. Reloading disk assets 200 times introduces significant 
+  latency that risks breaching the throughput threshold on standard campus workstations. The index and metadata should be loaded into memory once and reused across      
+  queries.                                                                                                                                                               
+  • Unused Component: In RAG_search.__init__, an instance of RAG_Indexer is initialized with text splitters, but is never utilized in search operations.                 
+  
+  #### 5. Arbitrary Upper Bound on k
+  
+  • Location: RAG.search, RAG.search_dataset, RAG.answer                                                                                                                 
+  • Problem: The methods enforce if k <= 0 or k > 10: return "K must be valid".                                                                                          
+  • Subject Requirement: The subject requires handling invalid inputs like k=0, but does not restrict k to 10. If an evaluator queries --k 15 or --k 20, the system      
+  rejects it as an error.
+  
+  #### 6. Inflexible Indexing Corpus Path
+  
+  • Location: RAG_Indexer.__init__ and RAG.index                                                                                                                         
+  • Problem:                                                                                                                                                             
+      • The corpus root defaults to "data/raw/vllm-0.10.1". If the reviewer extracts the raw archive into data/raw directly or under a slightly different folder name,   
+      rglob finds no files and terminates with an error. Traversing data/raw dynamically or checking path existence ensures safety.
+      • In RAG.index, the check if max_chunk_size < 200 or max_chunk_size > 2000: rejects chunk sizes smaller than 200 characters. Chapter VI.1 explicitly states that   
+      smaller chunks are allowed and encouraged for testing recall impact.                                                                                               
+  
+  ──────
+  ### CLI & Interface Discrepancies
+  
+  #### 7. Terminal Output Formatting for Single Query Search
+  
+  • Location: RAG.search                                                                                                                                                 
+  • Problem: Currently, search returns a raw Python list of dictionaries from MinimalSource.model_dump, which Fire prints as an unformatted JSON-like string.            
+  • Subject Requirement: Chapter VI.2 and the terminal walkthrough on page 13 show clean line-by-line output formatted as:
+  <file_path> [<first_character_index>:<last_character_index>]
+  
+  #### 8. Exception Handling with BaseException
+  
+  • Location: RAG.index, RAG.answer, RAG.answer_dataset, RAG_Indexer.ingest_corpus, RAG_answer.answer_dataset                                                            
+  • Problem: Several handlers catch BaseException rather than Exception. In Python, catching BaseException traps KeyboardInterrupt (preventing clean SIGINT / Ctrl+C     
+  termination) as well as SystemExit.
+  • Note: README.md:206-209 explicitly claims this was resolved by replacing BaseException with Exception everywhere, but the code still contains it.                    
+  ──────
+  ### README.md Compliance Review
+  
+  Reviewing README.md against Chapter VIII requirements:
+  
+  1. Unfilled Template Placeholders:
+      • Line 158 contains placeholder text: *(Fill in your actual numbers after running evaluate.)*, with placeholder values in the Recall table. Your measured benchmark
+      scores on the public test suite are 90.0% Recall@5 for docs and 85.9% Recall@5 for code. The table should reflect these actual validated figures.
+  2. Erroneous Commands in Documentation:
+      • Lines 60, 65, and 71 document commands as uv run -m src rag answer ... and uv run -m src rag search_dataset .... The Fire CLI exposes commands directly under src
+      without an intermediate rag subcommand; attempting to run rag answer causes Fire to report an unknown command.
+      • Lines 72 and 236 reference the argument --student_sr_path, whereas the argument defined in code and required by the subject is --student_search_results_path.    
+  3. AI Usage Section Too Brief:
+      • Chapter VIII requires a dedicated subsection specifying the exact tasks and modules where AI was utilized. The current text on line 254 (AI was used to          
+      understand the theory on this project !) lacks sufficient detail and does not mention specific project components (e.g., tokenizer handling, data modeling,        
+      architecture planning).
+  4. Header Attribution Format:
+      • Check line 1: *This project has been created as part of the 42 curriculum by [aguennac].*. Ensure the 42 intranet login is formatted as requested without        
+      surrounding square brackets, and that all contributors are included if working in a group.
+  
+  ──────
+  ### Makefile Quality Review
+  
+  • Rule clean: Line 17 runs find . -type d -name ".venv" -exec rm -rf {} +. Removing .venv during make clean deletes the entire virtual environment and forces a        
+  complete re-download of PyTorch and dependencies. The subject specifies cleaning temporary files and caches (__pycache__, .mypy_cache), not destroying the installed   
+  environment.
+  • Rule run: Line 8 executes uv run -m src index 2000. Using uv run python -m src index --max_chunk_size 2000 is more portable and aligns with the subject invocation   
+  syntax.
+  ──────
+  ### Recommended Action Plan
+  
+  1. In answer.py, construct the output filepath inside save_directory using the input file's name and ensure parent directories are created before saving.              
+  2. Add a .flake8 file excluding .venv, and declare flake8 and mypy in pyproject.toml. Update the Makefile lint command to run flake8 . and mypy . as required.         
+  3. Update .gitignore to exclude __pycache__/, *.pyc, *.pyo, and .ruff_cache/. Clean untracked caches from Git.
+  4. Optimize search.py by caching or loading the BM25 index and metadata once instead of reloading on every query in search_dataset.
+  5. Remove the k > 10 cap and the < 200 chunk size limit in __main__.py.
+  6. Format single-query search output to match the format shown in Chapter VI.2 (<path> [<start>:<end>]).
+  7. Update README.md with real recall numbers, correct CLI argument names, remove the rag subcommand prefix, and expand the AI usage description.

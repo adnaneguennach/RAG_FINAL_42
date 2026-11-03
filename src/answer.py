@@ -163,8 +163,8 @@ class RAG_answer:
             save_data = StudentSearchResultsAndAnswer(
                 search_results=min_answer, k=data["k"]
             )
-
-            with open("data/output/answer.json", "w") as f:
+            save_path = Path(save_directory)
+            with open(save_path / "answer.json", "w") as f:
                 json.dump(save_data.model_dump(), f, indent=4)
 
         except BaseException as e:
